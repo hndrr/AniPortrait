@@ -207,7 +207,7 @@ def main():
                 generator=generator,
             ).videos
 
-            video = torch.cat([ref_image_tensor, pose_tensor, video], dim=0)
+            # video = torch.cat([ref_image_tensor, pose_tensor, video], dim=0)
             save_path = f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_noaudio.mp4"
             save_videos_grid(
                 video,
