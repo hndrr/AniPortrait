@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 import numpy as np
 import cv2
+import random
 import torch
 
 from diffusers import AutoencoderKL, DDIMScheduler
@@ -23,21 +24,13 @@ from src.pipelines.pipeline_pose2vid_long import Pose2VideoPipeline
 from src.utils.util import get_fps, read_frames, save_videos_grid
 
 from src.audio_models.model import Audio2MeshModel
+from src.audio_models.pose_model import Audio2PoseModel
 from src.utils.audio_util import prepare_audio_feature
 from src.utils.mp_utils import LMKExtractor
 from src.utils.draw_util import FaceMeshVisualizer
-from src.utils.pose_util import (
-    project_points,
-    project_points_with_trans,
-    matrix_to_euler_and_translation,
-    euler_and_translation_to_matrix,
-)
+from src.utils.pose_util import project_points, project_points_with_trans, matrix_to_euler_and_translation, euler_and_translation_to_matrix, smooth_pose_seq
 from src.utils.util import crop_face
-from scripts.vid2vid import smooth_pose_seq
-from src.utils.frame_interpolation import (
-    init_frame_interpolation_model,
-    batch_images_interpolation_tool,
-)
+from src.utils.frame_interpolation import init_frame_interpolation_model, batch_images_interpolation_tool
 
 
 config = OmegaConf.load("./configs/prompts/animation_audio.yaml")
@@ -54,6 +47,10 @@ a2m_model.load_state_dict(
     strict=False,
 )
 a2m_model.cuda().eval()
+
+a2p_model = Audio2PoseModel(audio_infer_config['a2p_model'])
+a2p_model.load_state_dict(torch.load(audio_infer_config['pretrained_model']['a2p_ckpt']), strict=False)
+a2p_model.cuda().eval()
 
 vae = AutoencoderKL.from_pretrained(
     config.pretrained_vae_path,
@@ -169,6 +166,128 @@ def audio2video(
 
     generator = torch.manual_seed(seed)
 
+    width, height = size, size    
+
+    date_str = datetime.now().strftime("%Y%m%d")
+    time_str = datetime.now().strftime("%H%M")
+    save_dir_name = f"{time_str}--seed_{seed}-{size}x{size}"
+
+    save_dir = Path(f"output/{date_str}/{save_dir_name}")
+    while os.path.exists(save_dir):
+        save_dir = Path(f"output/{date_str}/{save_dir_name}_{np.random.randint(10000):04d}")
+    save_dir.mkdir(exist_ok=True, parents=True)
+
+    ref_image_np = cv2.cvtColor(ref_img, cv2.COLOR_RGB2BGR)
+    ref_image_np = crop_face(ref_image_np, lmk_extractor)
+    if ref_image_np is None:
+        return None, Image.fromarray(ref_img)
+    
+    ref_image_np = cv2.resize(ref_image_np, (size, size))
+    ref_image_pil = Image.fromarray(cv2.cvtColor(ref_image_np, cv2.COLOR_BGR2RGB))
+    
+    face_result = lmk_extractor(ref_image_np)
+    if face_result is None: 
+        return None, ref_image_pil
+
+    lmks = face_result['lmks'].astype(np.float32)
+    ref_pose = vis.draw_landmarks((ref_image_np.shape[1], ref_image_np.shape[0]), lmks, normed=True)
+    
+    sample = prepare_audio_feature(input_audio, wav2vec_model_path=audio_infer_config['a2m_model']['model_path'])
+    sample['audio_feature'] = torch.from_numpy(sample['audio_feature']).float().cuda()
+    sample['audio_feature'] = sample['audio_feature'].unsqueeze(0)
+
+    # inference
+    pred = a2m_model.infer(sample['audio_feature'], sample['seq_len'])
+    pred = pred.squeeze().detach().cpu().numpy()
+    pred = pred.reshape(pred.shape[0], -1, 3)
+    pred = pred + face_result['lmks3d']
+    
+    if headpose_video is not None:
+        pose_seq = get_headpose_temp(headpose_video)
+        mirrored_pose_seq = np.concatenate((pose_seq, pose_seq[-2:0:-1]), axis=0)
+        pose_seq = np.tile(mirrored_pose_seq, (sample['seq_len'] // len(mirrored_pose_seq) + 1, 1))[:sample['seq_len']]
+    else:
+        id_seed = random.randint(0, 99)
+        id_seed = torch.LongTensor([id_seed]).cuda()
+
+        # Currently, only inference up to a maximum length of 10 seconds is supported.
+        chunk_duration = 5 # 5 seconds
+        sr = 16000
+        fps = 30
+        chunk_size = sr * chunk_duration 
+
+        audio_chunks = list(sample['audio_feature'].split(chunk_size, dim=1))
+        seq_len_list = [chunk_duration*fps] * (len(audio_chunks) - 1) + [sample['seq_len'] % (chunk_duration*fps)] # 30 fps 
+
+        audio_chunks[-2] = torch.cat((audio_chunks[-2], audio_chunks[-1]), dim=1)
+        seq_len_list[-2] = seq_len_list[-2] + seq_len_list[-1]
+        del audio_chunks[-1]
+        del seq_len_list[-1]
+
+        pose_seq = []
+        for audio, seq_len in zip(audio_chunks, seq_len_list):
+            pose_seq_chunk = a2p_model.infer(audio, seq_len, id_seed)
+            pose_seq_chunk = pose_seq_chunk.squeeze().detach().cpu().numpy()
+            pose_seq_chunk[:, :3] *= 0.5
+            pose_seq.append(pose_seq_chunk)
+        
+        pose_seq = np.concatenate(pose_seq, 0)
+        pose_seq = smooth_pose_seq(pose_seq, 7)
+    
+    # project 3D mesh to 2D landmark
+    projected_vertices = project_points(pred, face_result['trans_mat'], pose_seq, [height, width])
+
+    pose_images = []
+    for i, verts in enumerate(projected_vertices):
+        lmk_img = vis.draw_landmarks((width, height), verts, normed=False)
+        pose_images.append(lmk_img)
+
+    pose_list = []
+    args_L = len(pose_images) if length==0 or length > len(pose_images) else length
+    for pose_image_np in pose_images[: args_L : fi_step]:
+        pose_image_np = cv2.resize(pose_image_np,  (width, height))
+        pose_list.append(pose_image_np)
+    
+    pose_list = np.array(pose_list)
+    
+    video_length = len(pose_list)
+
+    video = pipe(
+        ref_image_pil,
+        pose_list,
+        ref_pose,
+        width,
+        height,
+        video_length,
+        steps,
+        cfg,
+        generator=generator,
+    ).videos
+    
+    if acc_flag:
+        video = batch_images_interpolation_tool(video, frame_inter_model, inter_frames=fi_step-1)
+
+    save_path = f"{save_dir}/{size}x{size}_{time_str}_noaudio.mp4"
+    save_videos_grid(
+        video,
+        save_path,
+        n_rows=1,
+        fps=fps,
+    )
+    
+    stream = ffmpeg.input(save_path)
+    audio = ffmpeg.input(input_audio)
+    ffmpeg.output(stream.video, audio.audio, save_path.replace('_noaudio.mp4', '.mp4'), vcodec='copy', acodec='aac', shortest=None).run()
+    os.remove(save_path)
+    
+    return save_path.replace('_noaudio.mp4', '.mp4'), ref_image_pil
+
+def video2video(ref_img, source_video, size=512, steps=25, length=60, seed=42, acc_flag=True):
+    cfg = 3.5
+    fi_step = 3 if acc_flag else 1
+    
+    generator = torch.manual_seed(seed)
+    
     lmk_extractor = LMKExtractor()
     vis = FaceMeshVisualizer()
 
