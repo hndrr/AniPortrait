@@ -160,6 +160,7 @@ def audio2video(
     seed=42,
     acc_flag=True,
 ):
+    lmk_extractor = LMKExtractor()
     fps = 30
     cfg = 3.5
     fi_step = 3 if acc_flag else 1
