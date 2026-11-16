@@ -24,15 +24,20 @@ from src.models.unet_2d_condition import UNet2DConditionModel
 from src.models.unet_3d import UNet3DConditionModel
 from src.pipelines.pipeline_pose2vid_long import Pose2VideoPipeline
 from src.utils.util import get_fps, read_frames, save_videos_grid
-from src.utils.frame_interpolation import init_frame_interpolation_model, batch_images_interpolation_tool
+from src.utils.frame_interpolation import (
+    init_frame_interpolation_model,
+    batch_images_interpolation_tool,
+)
 
-from src.utils.mp_utils  import LMKExtractor
+from src.utils.mp_utils import LMKExtractor
 from src.utils.draw_util import FaceMeshVisualizer
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default='./configs/prompts/animation.yaml')
+    parser.add_argument(
+        "--config", type=str, default="./configs/prompts/animation.yaml"
+    )
     parser.add_argument("-W", type=int, default=512)
     parser.add_argument("-H", type=int, default=512)
     parser.add_argument("-L", type=int)
@@ -40,11 +45,12 @@ def parse_args():
     parser.add_argument("--cfg", type=float, default=3.5)
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--fps", type=int)
-    parser.add_argument("-acc", "--accelerate", action='store_true')
+    parser.add_argument("-acc", "--accelerate", action="store_true")
     parser.add_argument("--fi_step", type=int, default=3)
     args = parser.parse_args()
 
     return args
+
 
 def main():
     args = parse_args()
@@ -74,8 +80,10 @@ def main():
         unet_additional_kwargs=infer_config.unet_additional_kwargs,
     ).to(dtype=weight_dtype, device="cuda")
 
-    pose_guider = PoseGuider(noise_latent_channels=320, use_ca=True).to(device="cuda", dtype=weight_dtype) # not use cross attention
-    
+    pose_guider = PoseGuider(noise_latent_channels=320, use_ca=True).to(
+        device="cuda", dtype=weight_dtype
+    )  # not use cross attention
+
     image_enc = CLIPVisionModelWithProjection.from_pretrained(
         config.image_encoder_path
     ).to(dtype=weight_dtype, device="cuda")
@@ -116,13 +124,12 @@ def main():
     save_dir = Path(f"output/{date_str}/{save_dir_name}")
     save_dir.mkdir(exist_ok=True, parents=True)
 
-
     lmk_extractor = LMKExtractor()
     vis = FaceMeshVisualizer(forehead_edge=False)
-    
+
     if args.accelerate:
         frame_inter_model = init_frame_interpolation_model()
-    
+
     for ref_image_path in config["test_cases"].keys():
         # Each ref_image may correspond to multiple actions
         for pose_video_path in config["test_cases"][ref_image_path]:
@@ -132,11 +139,15 @@ def main():
             ref_image_pil = Image.open(ref_image_path).convert("RGB")
             ref_image_np = cv2.cvtColor(np.array(ref_image_pil), cv2.COLOR_RGB2BGR)
             ref_image_np = cv2.resize(ref_image_np, (args.H, args.W))
-            
+
             face_result = lmk_extractor(ref_image_np)
-            assert face_result is not None, "Can not detect a face in the reference image."
-            lmks = face_result['lmks'].astype(np.float32)
-            ref_pose = vis.draw_landmarks((ref_image_np.shape[1], ref_image_np.shape[0]), lmks, normed=True)
+            assert (
+                face_result is not None
+            ), "Can not detect a face in the reference image."
+            lmks = face_result["lmks"].astype(np.float32)
+            ref_pose = vis.draw_landmarks(
+                (ref_image_np.shape[1], ref_image_np.shape[0]), lmks, normed=True
+            )
 
             pose_list = []
             pose_tensor_list = []
@@ -147,16 +158,18 @@ def main():
                 [transforms.Resize((height, width)), transforms.ToTensor()]
             )
             args_L = len(pose_images) if args.L is None else args.L
-            for pose_image_pil in pose_images[: args_L]:
+            for pose_image_pil in pose_images[:args_L]:
                 pose_tensor_list.append(pose_transform(pose_image_pil))
             sub_step = args.fi_step if args.accelerate else 1
-            for pose_image_pil in pose_images[: args.L: sub_step]:
-                pose_image_np = cv2.cvtColor(np.array(pose_image_pil), cv2.COLOR_RGB2BGR)
-                pose_image_np = cv2.resize(pose_image_np,  (width, height))
+            for pose_image_pil in pose_images[: args.L : sub_step]:
+                pose_image_np = cv2.cvtColor(
+                    np.array(pose_image_pil), cv2.COLOR_RGB2BGR
+                )
+                pose_image_np = cv2.resize(pose_image_np, (width, height))
                 pose_list.append(pose_image_np)
-            
+
             pose_list = np.array(pose_list)
-            
+
             video_length = len(pose_list)
 
             pose_tensor = torch.stack(pose_tensor_list, dim=0)  # (f, c, h, w)
@@ -174,19 +187,23 @@ def main():
                 args.cfg,
                 generator=generator,
             ).videos
-            
+
             if args.accelerate:
-                video = batch_images_interpolation_tool(video, frame_inter_model, inter_frames=args.fi_step-1)
-            
+                video = batch_images_interpolation_tool(
+                    video, frame_inter_model, inter_frames=args.fi_step - 1
+                )
+
             ref_image_tensor = pose_transform(ref_image_pil)  # (c, h, w)
             ref_image_tensor = ref_image_tensor.unsqueeze(1).unsqueeze(
                 0
             )  # (1, c, 1, h, w)
             ref_image_tensor = repeat(
-                ref_image_tensor, "b c f h w -> b c (repeat f) h w", repeat=video.shape[2]
+                ref_image_tensor,
+                "b c f h w -> b c (repeat f) h w",
+                repeat=video.shape[2],
             )
 
-            video = torch.cat([ref_image_tensor, pose_tensor[:,:,:video.shape[2]], video], dim=0)
+            # video = torch.cat([ref_image_tensor, pose_tensor[:,:,:video.shape[2]], video], dim=0)
             save_path = f"{save_dir}/{ref_name}_{pose_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_noaudio.mp4"
             save_videos_grid(
                 video,
@@ -195,16 +212,24 @@ def main():
                 fps=src_fps if args.fps is None else args.fps,
             )
 
-            audio_output = 'audio_from_video.aac'
+            audio_output = "audio_from_video.aac"
             # extract audio
-            ffmpeg.input(pose_video_path).output(audio_output, acodec='copy').run()
+            ffmpeg.input(pose_video_path).output(audio_output, acodec="copy").run()
             # merge audio and video
             stream = ffmpeg.input(save_path)
             audio = ffmpeg.input(audio_output)
-            ffmpeg.output(stream.video, audio.audio, save_path.replace('_noaudio.mp4', '.mp4'), vcodec='copy', acodec='aac', shortest=None).run()
-            
+            ffmpeg.output(
+                stream.video,
+                audio.audio,
+                save_path.replace("_noaudio.mp4", ".mp4"),
+                vcodec="copy",
+                acodec="aac",
+                shortest=None,
+            ).run()
+
             os.remove(save_path)
             os.remove(audio_output)
+
 
 if __name__ == "__main__":
     main()

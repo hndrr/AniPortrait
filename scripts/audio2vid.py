@@ -29,7 +29,7 @@ from src.utils.util import get_fps, read_frames, save_videos_grid
 from src.audio_models.model import Audio2MeshModel
 from src.audio_models.pose_model import Audio2PoseModel
 from src.utils.audio_util import prepare_audio_feature
-from src.utils.mp_utils  import LMKExtractor
+from src.utils.mp_utils import LMKExtractor
 from src.utils.draw_util import FaceMeshVisualizer
 from src.utils.pose_util import project_points, smooth_pose_seq
 from src.utils.frame_interpolation import init_frame_interpolation_model, batch_images_interpolation_tool
@@ -37,7 +37,9 @@ from src.utils.frame_interpolation import init_frame_interpolation_model, batch_
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, default='./configs/prompts/animation_audio.yaml')
+    parser.add_argument(
+        "--config", type=str, default="./configs/prompts/animation_audio.yaml"
+    )
     parser.add_argument("-W", type=int, default=512)
     parser.add_argument("-H", type=int, default=512)
     parser.add_argument("-L", type=int)
@@ -45,11 +47,12 @@ def parse_args():
     parser.add_argument("--cfg", type=float, default=3.5)
     parser.add_argument("--steps", type=int, default=25)
     parser.add_argument("--fps", type=int, default=30)
-    parser.add_argument("-acc", "--accelerate", action='store_true')
+    parser.add_argument("-acc", "--accelerate", action="store_true")
     parser.add_argument("--fi_step", type=int, default=3)
     args = parser.parse_args()
 
     return args
+
 
 def main():
     args = parse_args()
@@ -60,11 +63,13 @@ def main():
         weight_dtype = torch.float16
     else:
         weight_dtype = torch.float32
-        
+
     audio_infer_config = OmegaConf.load(config.audio_inference_config)
     # prepare model
-    a2m_model = Audio2MeshModel(audio_infer_config['a2m_model'])
-    a2m_model.load_state_dict(torch.load(audio_infer_config['pretrained_model']['a2m_ckpt']), strict=False)
+    a2m_model = Audio2MeshModel(audio_infer_config["a2m_model"])
+    a2m_model.load_state_dict(
+        torch.load(audio_infer_config["pretrained_model"]["a2m_ckpt"]), strict=False
+    )
     a2m_model.cuda().eval()
 
     a2p_model = Audio2PoseModel(audio_infer_config['a2p_model'])
@@ -89,8 +94,9 @@ def main():
         unet_additional_kwargs=infer_config.unet_additional_kwargs,
     ).to(dtype=weight_dtype, device="cuda")
 
-
-    pose_guider = PoseGuider(noise_latent_channels=320, use_ca=True).to(device="cuda", dtype=weight_dtype) # not use cross attention
+    pose_guider = PoseGuider(noise_latent_channels=320, use_ca=True).to(
+        device="cuda", dtype=weight_dtype
+    )  # not use cross attention
 
     image_enc = CLIPVisionModelWithProjection.from_pretrained(
         config.image_encoder_path
@@ -132,10 +138,9 @@ def main():
     save_dir = Path(f"output/{date_str}/{save_dir_name}")
     save_dir.mkdir(exist_ok=True, parents=True)
 
-
     lmk_extractor = LMKExtractor()
     vis = FaceMeshVisualizer(forehead_edge=False)
-    
+
     if args.accelerate:
         frame_inter_model = init_frame_interpolation_model()
 
@@ -148,18 +153,25 @@ def main():
             ref_image_pil = Image.open(ref_image_path).convert("RGB")
             ref_image_np = cv2.cvtColor(np.array(ref_image_pil), cv2.COLOR_RGB2BGR)
             ref_image_np = cv2.resize(ref_image_np, (args.H, args.W))
-            
+
             face_result = lmk_extractor(ref_image_np)
             assert face_result is not None, "No face detected."
-            lmks = face_result['lmks'].astype(np.float32)
-            ref_pose = vis.draw_landmarks((ref_image_np.shape[1], ref_image_np.shape[0]), lmks, normed=True)
-            
-            sample = prepare_audio_feature(audio_path, wav2vec_model_path=audio_infer_config['a2m_model']['model_path'])
-            sample['audio_feature'] = torch.from_numpy(sample['audio_feature']).float().cuda()
-            sample['audio_feature'] = sample['audio_feature'].unsqueeze(0)
+            lmks = face_result["lmks"].astype(np.float32)
+            ref_pose = vis.draw_landmarks(
+                (ref_image_np.shape[1], ref_image_np.shape[0]), lmks, normed=True
+            )
+
+            sample = prepare_audio_feature(
+                audio_path,
+                wav2vec_model_path=audio_infer_config["a2m_model"]["model_path"],
+            )
+            sample["audio_feature"] = (
+                torch.from_numpy(sample["audio_feature"]).float().cuda()
+            )
+            sample["audio_feature"] = sample["audio_feature"].unsqueeze(0)
 
             # inference
-            pred = a2m_model.infer(sample['audio_feature'], sample['seq_len'])
+            pred = a2m_model.infer(sample["audio_feature"], sample["seq_len"])
             pred = pred.squeeze().detach().cpu().numpy()
             pred = pred.reshape(pred.shape[0], -1, 3)
             pred = pred + face_result['lmks3d']
@@ -211,16 +223,18 @@ def main():
                 [transforms.Resize((height, width)), transforms.ToTensor()]
             )
             args_L = len(pose_images) if args.L is None else args.L
-            for pose_image_np in pose_images[: args_L]:
-                pose_image_pil = Image.fromarray(cv2.cvtColor(pose_image_np, cv2.COLOR_BGR2RGB))
+            for pose_image_np in pose_images[:args_L]:
+                pose_image_pil = Image.fromarray(
+                    cv2.cvtColor(pose_image_np, cv2.COLOR_BGR2RGB)
+                )
                 pose_tensor_list.append(pose_transform(pose_image_pil))
             sub_step = args.fi_step if args.accelerate else 1
-            for pose_image_np in pose_images[: args_L: sub_step]:
-                pose_image_np = cv2.resize(pose_image_np,  (width, height))
+            for pose_image_np in pose_images[:args_L:sub_step]:
+                pose_image_np = cv2.resize(pose_image_np, (width, height))
                 pose_list.append(pose_image_np)
-            
+
             pose_list = np.array(pose_list)
-            
+
             video_length = len(pose_list)
 
             pose_tensor = torch.stack(pose_tensor_list, dim=0)  # (f, c, h, w)
@@ -238,19 +252,23 @@ def main():
                 args.cfg,
                 generator=generator,
             ).videos
-            
+
             if args.accelerate:
-                video = batch_images_interpolation_tool(video, frame_inter_model, inter_frames=args.fi_step-1)
+                video = batch_images_interpolation_tool(
+                    video, frame_inter_model, inter_frames=args.fi_step - 1
+                )
 
             ref_image_tensor = pose_transform(ref_image_pil)  # (c, h, w)
             ref_image_tensor = ref_image_tensor.unsqueeze(1).unsqueeze(
                 0
             )  # (1, c, 1, h, w)
             ref_image_tensor = repeat(
-                ref_image_tensor, "b c f h w -> b c (repeat f) h w", repeat=video.shape[2]
+                ref_image_tensor,
+                "b c f h w -> b c (repeat f) h w",
+                repeat=video.shape[2],
             )
-            
-            video = torch.cat([ref_image_tensor, pose_tensor[:,:,:video.shape[2]], video], dim=0)
+
+            # video = torch.cat([ref_image_tensor, pose_tensor[:,:,:video.shape[2]], video], dim=0)
             save_path = f"{save_dir}/{ref_name}_{audio_name}_{args.H}x{args.W}_{int(args.cfg)}_{time_str}_noaudio.mp4"
             save_videos_grid(
                 video,
@@ -258,12 +276,19 @@ def main():
                 n_rows=3,
                 fps=args.fps,
             )
-            
+
             stream = ffmpeg.input(save_path)
             audio = ffmpeg.input(audio_path)
-            ffmpeg.output(stream.video, audio.audio, save_path.replace('_noaudio.mp4', '.mp4'), vcodec='copy', acodec='aac', shortest=None).run()
+            ffmpeg.output(
+                stream.video,
+                audio.audio,
+                save_path.replace("_noaudio.mp4", ".mp4"),
+                vcodec="copy",
+                acodec="aac",
+                shortest=None,
+            ).run()
             os.remove(save_path)
+
 
 if __name__ == "__main__":
     main()
-    
